@@ -35,10 +35,11 @@ class DecoratorModel:
         self.vocabulary = vocabulary
         self.max_sequence_length = max_sequence_length
         self.network = decorator
-        self._model_modes = GenerativeModelRegimeEnum()
-
         self.distributed = distributed
         self.rank = rank
+
+        self._model_modes = GenerativeModelRegimeEnum()
+
         device = torch.device(
             f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu"
         )
@@ -46,6 +47,19 @@ class DecoratorModel:
         if torch.cuda.is_available() and not no_cuda:
             # self.network.cuda()
             self.network = self.network.to(device)
+
+        if distributed:
+            torch.distributed.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                rank=rank,
+                world_size=world_size,
+                timeout=timedelta(hours=1),
+            )
+            torch.cuda.set_device(rank)
+            self.network = tnn.parallel.DistributedDataParallel(
+                self.network, device_ids=[rank], output_device=rank
+            )
 
         self._nll_loss = tnn.NLLLoss(reduction="none", ignore_index=0)
         self.set_mode(mode)
@@ -64,24 +78,13 @@ class DecoratorModel:
 
         decorator = mdec.Decorator(**data["decorator"]["params"])
         decorator.load_state_dict(data["decorator"]["state"])
-        if distributed:
-            torch.distributed.init_process_group(
-                backend="nccl",
-                init_method="env://",
-                rank=rank,
-                world_size=world_size,
-                timeout=timedelta(hours=1),
-            )
-            torch.cuda.set_device(rank)
-            decorator = tnn.parallel.DistributedDataParallel(
-                decorator, device_ids=[rank], output_device=rank
-            )
 
         model = DecoratorModel(
             decorator=decorator,
             mode=mode,
             distributed=distributed,
             world_size=world_size,
+            rank=rank,
             **data["model"],
         )
 
