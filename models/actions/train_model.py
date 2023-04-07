@@ -1,18 +1,30 @@
+from tqdm import tqdm
 import torch.nn.utils as tnnu
 import torch.utils.data as tud
-
+import torch
 import models.dataset as md
 from models.actions import Action
 from models.actions.collect_stats_from_model import CollectStatsFromModel
 from running_modes.configurations import TransferLearningConfiguration
 from running_modes.enums import GenerativeModelRegimeEnum
-from running_modes.transfer_learning.logging.base_transfer_learning_logger import BaseTransferLearningLogger
+from running_modes.transfer_learning.logging.base_transfer_learning_logger import (
+    BaseTransferLearningLogger,
+)
+from torch.utils.data.distributed import DistributedSampler
 
 
 class TrainModel(Action):
-
-    def __init__(self, model, configuration: TransferLearningConfiguration, optimizer, training_sets, validation_sets,
-                 lr_scheduler, logger: BaseTransferLearningLogger):
+    def __init__(
+        self,
+        model,
+        configuration: TransferLearningConfiguration,
+        optimizer,
+        training_sets,
+        validation_sets,
+        lr_scheduler,
+        logger: BaseTransferLearningLogger,
+        rank: int = 0,
+    ):
         """
         Initializes the training of an epoch.
         : param model: A model instance, not loaded in scaffold_decorating mode.
@@ -30,32 +42,51 @@ class TrainModel(Action):
         self.training_sets = training_sets
         self.validation_sets = validation_sets
         self.lr_scheduler = lr_scheduler
+        self.rank = rank
         self.model_regime_enum = GenerativeModelRegimeEnum()
 
     def run(self):
-        for epoch, training_set, validation_set in zip(range(1, self.config.epochs + 1), self.training_sets,
-                                                       self.validation_sets):
+        for epoch, training_set, validation_set in zip(
+            range(1, self.config.epochs + 1),
+            self.training_sets,
+            self.validation_sets,
+        ):
             dataloader = self._initialize_dataloader(training_set)
 
             # iterate over training batch
-            for scaffold_batch, decorator_batch in dataloader:
-                loss = self.model.likelihood(*scaffold_batch, *decorator_batch).mean()
+            for scaffold_batch, decorator_batch in tqdm(dataloader):
+                loss = self.model.likelihood(
+                    *scaffold_batch, *decorator_batch
+                ).mean()
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 if self.config.clip_gradients > 0:
-                    tnnu.clip_grad_norm_(self.model.network.parameters(), self.config.clip_gradients)
+                    tnnu.clip_grad_norm_(
+                        self.model.network.parameters(),
+                        self.config.clip_gradients,
+                    )
 
                 self.optimizer.step()
 
             # Get stats and logs
-            self.collect_stats(epoch=epoch, training_set=training_set, validation_set=validation_set)
+            self.collect_stats(
+                epoch=epoch,
+                training_set=training_set,
+                validation_set=validation_set,
+            )
 
             # update LR
             self.lr_scheduler.step()
 
             # determine if training should continue
-            terminate = self.checkpoint(self.lr_scheduler.optimizer.param_groups[0]["lr"], epoch)
+            terminate = False
+            if self.rank == 0:
+                terminate = self.checkpoint(
+                    self.lr_scheduler.optimizer.param_groups[0]["lr"], epoch
+                )
+            if self.config.distributed:
+                torch.distributed.barrier()
 
             if terminate:
                 self.model.save(f"{self.config.output_path}/trained.{epoch}")
@@ -63,17 +94,25 @@ class TrainModel(Action):
 
     def collect_stats(self, epoch, training_set, validation_set):
         self.model.set_mode(self.model_regime_enum.INFERENCE)
-        stats = CollectStatsFromModel(model=self.model, epoch=epoch, sample_size=self.config.sample_size,
-                                      training_set=training_set, validation_set=validation_set).run()
+        stats = CollectStatsFromModel(
+            model=self.model,
+            epoch=epoch,
+            sample_size=self.config.sample_size,
+            training_set=training_set,
+            validation_set=validation_set,
+        ).run()
 
-        self.logger.log_timestep(lr=self.lr_scheduler.optimizer.param_groups[0]["lr"], epoch=epoch,
-                                 training_smiles=stats['sampled_training_mols'],
-                                 validation_smiles=stats['sampled_validation_mols'],
-                                 validation_nlls=stats['validation_nlls'],
-                                 training_nlls=stats['training_nlls'],
-                                 jsd_data_no_bins=stats['unbinned_jsd'],
-                                 jsd_data_bins=stats['binned_jsd'],
-                                 model=self.model)
+        self.logger.log_timestep(
+            lr=self.lr_scheduler.optimizer.param_groups[0]["lr"],
+            epoch=epoch,
+            training_smiles=stats["sampled_training_mols"],
+            validation_smiles=stats["sampled_validation_mols"],
+            validation_nlls=stats["validation_nlls"],
+            training_nlls=stats["training_nlls"],
+            jsd_data_no_bins=stats["unbinned_jsd"],
+            jsd_data_bins=stats["binned_jsd"],
+            model=self.model,
+        )
         self.model.set_mode(self.model_regime_enum.TRAINING)
 
     def checkpoint(self, lr, epoch):
@@ -83,15 +122,33 @@ class TrainModel(Action):
             terminate_flag = True
 
         elif self.config.epochs == epoch:
-            self.logger.log_message(f"Reached maximum number of epochs ({epoch}). Saving and terminating.")
+            self.logger.log_message(
+                f"Reached maximum number of epochs ({epoch}). Saving and terminating."
+            )
             terminate_flag = True
 
-        elif self.config.save_frequency > 0 and (epoch % self.config.save_frequency == 0):
+        elif self.config.save_frequency > 0 and (
+            epoch % self.config.save_frequency == 0
+        ):
             self.model.save(f"{self.config.output_path}/trained.{epoch}")
-            self.logger.log_message(f"Checkpoint after epoch {epoch}. Saving the model.")
+            self.logger.log_message(
+                f"Checkpoint after epoch {epoch}. Saving the model."
+            )
         return terminate_flag
 
     def _initialize_dataloader(self, training_set):
-        dataset = md.DecoratorDataset(training_set, vocabulary=self.model.vocabulary)
-        return tud.DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True,
-                              collate_fn=md.DecoratorDataset.collate_fn, drop_last=True)
+        dataset = md.DecoratorDataset(
+            training_set, vocabulary=self.model.vocabulary
+        )
+        sampler = (
+            DistributedSampler(dataset) if self.config.distributed else None
+        )
+
+        return tud.DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=(sampler is None),
+            collate_fn=md.DecoratorDataset.collate_fn,
+            drop_last=True,
+            sampler=sampler,
+        )

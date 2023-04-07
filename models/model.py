@@ -40,13 +40,13 @@ class DecoratorModel:
 
         self._model_modes = GenerativeModelRegimeEnum()
 
-        device = torch.device(
+        self.device = torch.device(
             f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu"
         )
 
         if torch.cuda.is_available() and not no_cuda:
             # self.network.cuda()
-            self.network = self.network.to(device)
+            self.network = self.network.to(self.device)
 
         if distributed:
             torch.distributed.init_process_group(
@@ -138,12 +138,11 @@ class DecoratorModel:
         :param decoration_seq_lengths: The length of the decorator sequences (for packing purposes).
         :return:  (batch) Log likelihood for each item in the batch.
         """
-
         # NOTE: the decoration_seq_lengths have a - 1 to prevent the end token to be forward-passed.
         logits = self.network(
-            scaffold_seqs,
+            scaffold_seqs.to(self.device),
             scaffold_seq_lengths,
-            decoration_seqs,
+            decoration_seqs.to(self.device),
             decoration_seq_lengths - 1,
         )  # (batch, seq - 1, voc)
         log_probs = logits.log_softmax(dim=2).transpose(
@@ -171,16 +170,35 @@ class DecoratorModel:
         ).cuda()  # (batch, 1)
         # print(f"input_vector: {input_vector}")
         seq_lengths = torch.ones(batch_size)  # (batch)
-        encoder_padded_seqs, hidden_states = self.network.forward_encoder(
-            scaffold_seqs, scaffold_seq_lengths
-        )
+        if self.distributed:
+            (
+                encoder_padded_seqs,
+                hidden_states,
+            ) = self.network.module.forward_encoder(
+                scaffold_seqs, scaffold_seq_lengths
+            )
+        else:
+            encoder_padded_seqs, hidden_states = self.network.forward_encoder(
+                scaffold_seqs, scaffold_seq_lengths
+            )
         nlls = torch.zeros(batch_size).cuda()
         not_finished = torch.ones(batch_size, 1, dtype=torch.long).cuda()
         sequences = []
         for _ in range(self.max_sequence_length - 1):
-            logits, hidden_states, _ = self.network.forward_decoder(
-                input_vector, seq_lengths, encoder_padded_seqs, hidden_states
-            )  # (batch, 1, voc)
+            if self.distributed:
+                logits, hidden_states, _ = self.network.module.forward_decoder(
+                    input_vector,
+                    seq_lengths,
+                    encoder_padded_seqs,
+                    hidden_states,
+                )  # (batch, 1, voc)
+            else:
+                logits, hidden_states, _ = self.network.forward_decoder(
+                    input_vector,
+                    seq_lengths,
+                    encoder_padded_seqs,
+                    hidden_states,
+                )  # (batch, 1, voc)
             probs = logits.softmax(dim=2).squeeze()  # (batch, voc)
             log_probs = logits.log_softmax(dim=2).squeeze()  # (batch, voc)
             input_vector = (

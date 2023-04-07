@@ -141,7 +141,7 @@ class Decoder(tnn.Module):
         """
         padded_encoded_seqs = self._embedding(padded_seqs)
         packed_encoded_seqs = tnnur.pack_padded_sequence(
-            padded_encoded_seqs, seq_lengths, batch_first=True, enforce_sorted=False)
+            padded_encoded_seqs, seq_lengths.cpu(), batch_first=True, enforce_sorted=False)
         packed_encoded_seqs, hidden_states = self._rnn(packed_encoded_seqs, hidden_states)
         padded_encoded_seqs, _ = tnnur.pad_packed_sequence(packed_encoded_seqs, batch_first=True)  # (batch, seq, dim)
 
@@ -184,8 +184,8 @@ class Decorator(tnn.Module):
         :param decoder_seq_lengths: The lengths of the decoder sequences.
         :return : The output logits as a tensor (batch, seq_d, dim).
         """
-        encoder_padded_seqs, hidden_states = self.forward_encoder(encoder_seqs, encoder_seq_lengths)
-        logits, _, _ = self.forward_decoder(decoder_seqs, decoder_seq_lengths, encoder_padded_seqs, hidden_states)
+        encoder_padded_seqs, hidden_states = self.forward_encoder(encoder_seqs, encoder_seq_lengths.cpu())
+        logits, _, _ = self.forward_decoder(decoder_seqs, decoder_seq_lengths.cpu(), encoder_padded_seqs, hidden_states)
         return logits
 
     def forward_encoder(self, padded_seqs, seq_lengths):

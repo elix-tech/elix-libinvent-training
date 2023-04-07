@@ -27,3 +27,4 @@ class TransferLearningConfiguration:
     batch_size: int = 128
     clip_gradients: float = 1.0
     collect_stats_frequency: int = 0
+    distributed: bool = False
